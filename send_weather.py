@@ -61,7 +61,6 @@ DIAGRAM_URL = (
     "https://wetterzentrale.de/de/show_diagrams.php"
     "?geoid={geoid}&model={model}&var={var}&run={run:02d}&lid={lid}&bw=1"
 )
-DIAGRAM_LOADING_MARKERS = ("loading data", "wird geladen", "keine daten", "nicht verfügbar", "fehler")
 
 # (Modellcode für show_diagrams.php, Anzeigename)
 DIAGRAM_MODELS = [
@@ -149,17 +148,42 @@ def build_diagram_caption(display_name: str, lid: str, run_dt: datetime) -> str:
     )
 
 
+COOKIE_ACCEPT_SELECTORS = [
+    "button:has-text('Alle akzeptieren')",
+    "button:has-text('Akzeptieren')",
+    "button:has-text('Zustimmen')",
+    "button:has-text('Einverstanden')",
+    "#cmpwelcomebtnyes",
+    ".cmpboxbtnyes",
+    "[aria-label='Accept all']",
+]
+
+
+def dismiss_cookie_banner(page):
+    """Best-effort: schließt ein Cookie-/Consent-Banner, falls eins da ist."""
+    for selector in COOKIE_ACCEPT_SELECTORS:
+        try:
+            btn = page.locator(selector).first
+            if btn.is_visible(timeout=1500):
+                btn.click(timeout=1500)
+                page.wait_for_timeout(500)
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 def screenshot_diagram(browser, model: str, run_dt: datetime, lid: str, out_path: str) -> bool:
     url = DIAGRAM_URL.format(geoid=DIAGRAM_GEOID, model=model, var=DIAGRAM_VAR, run=run_dt.hour, lid=lid)
     page = browser.new_page(viewport={"width": 1200, "height": 1200})
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
+        dismiss_cookie_banner(page)
         page.wait_for_timeout(4000)  # Chart-Rendering abwarten
-        content = page.content().lower()
-        if any(marker in content for marker in DIAGRAM_LOADING_MARKERS):
-            return False
         page.screenshot(path=out_path, full_page=True)
-        return os.path.exists(out_path) and os.path.getsize(out_path) > 20_000
+        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        print(f"Diagramm-Screenshot {model}/{lid}: {size} Bytes ({url})")
+        return size > 15_000
     except Exception as exc:  # noqa: BLE001
         print(f"Diagramm-Fehler ({model}, {lid}, {url}): {exc}")
         return False
