@@ -21,9 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Abhängigkeiten installieren
-        run: |
-          pip install requests playwright
-          playwright install --with-deps chromium
+        run: pip install requests
 
       - name: Wetterkarten senden
         env:
