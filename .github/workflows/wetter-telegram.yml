@@ -1,0 +1,30 @@
+name: Wetterkarten an Telegram senden
+
+on:
+  schedule:
+    # UTC-Zeiten! Aktuell 06:00 / 12:00 / 18:00 UTC
+    # = 08:00 / 14:00 / 20:00 Uhr Sommerzeit (CEST, UTC+2)
+    # = 07:00 / 13:00 / 19:00 Uhr Winterzeit (CET,  UTC+1)
+    - cron: "0 6,12,18 * * *"
+  workflow_dispatch: {}   # erlaubt manuelles Auslösen zum Testen ("Run workflow" Button)
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install requests
+
+      - name: Wetterkarten senden
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python send_weather.py
