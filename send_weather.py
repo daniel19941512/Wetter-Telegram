@@ -3,33 +3,31 @@
 Schickt 3x täglich (per GitHub Actions Cron) aktuelle Niederschlags-Informationen
 von wetterzentrale.de für ECMWF, GFS, ICON und AIFS an einen Telegram-Chat.
 
-Teil 1 – Gesamtkarten (statische Bilder, schnell):
+Teil 1 – Gesamtkarten (statische Bilder):
   Gesamt-Niederschlagssumme (var=18), Region Mitteleuropa (map=3),
   Vorhersagestunde +144h (6 Tage), jeweils der aktuellste verfügbare Modelllauf.
   Für GFS wird das echte Ensemble-Mittel (Member "AVG") verwendet, da
   wetterzentrale.de das auf dieser Karte nur für GFS anbietet. Bei ECMWF, ICON
   und AIFS gibt es dort kein Ensemble-Mittel für diese Karte -> operationeller Lauf.
 
-Teil 2 – Ensemble-Diagramm für Ebringen (JS-Chart, per Screenshot):
-  Diese Diagrammseite (show_diagrams.php) rendert den Chart per JavaScript,
-  es gibt kein fertiges Bild zum Verlinken. Deshalb wird die Seite mit einem
-  headless Chromium-Browser (Playwright) geöffnet und ein Screenshot gemacht.
-  Enthält alle Ensemble-Member + CONTROL + AVG (= "Mittel aller Berechnungen")
-  + OPER, sofern das Modell Ensemble-Daten anbietet (lid=ENS). Falls nicht
-  (z.B. vermutlich bei AIFS), Rückfall auf den operationellen Lauf (lid=OP).
+Teil 2 – Ensemble-Diagramm für Ebringen (statisches Bild):
+  Nutzt den Server-Endpunkt ens_image.php (Kombi-Chart "850 hPa Temp. &
+  Niederschlag"), der ein fertiges PNG liefert - kein JavaScript-Rendering,
+  kein Cookie-Banner-Problem wie bei der interaktiven Diagrammseite. Enthält
+  alle Ensemble-Member + AVG (= "Mittel aller Berechnungen") + operationeller
+  Lauf, sofern das Modell Ensemble-Daten anbietet (member=ENS). Falls nicht,
+  Rückfall auf den operationellen Lauf (member=OP).
 
 Benötigte Umgebungsvariablen (als GitHub Secrets):
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
 """
 
-import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
-from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # Konfiguration – Gesamtkarten
@@ -38,7 +36,7 @@ from playwright.sync_api import sync_playwright
 MAP_REGION = 3        # Mitteleuropa
 VAR_PRECIP = 18        # Gesamt-Niederschlagssumme
 FORECAST_HOUR = 144     # +144h (6 Tage)
-MAX_RUN_FALLBACKS = 6    # wie viele 6h-Schritte zurück probiert werden, falls Karte noch nicht da ist
+MAX_RUN_FALLBACKS = 6    # wie viele 6h-Schritte zurück probiert werden, falls noch nichts da ist
 
 MAP_URL = "https://wetterzentrale.de/maps/{model}{lid}ME{run:02d}_{time}_{var}.png"
 
@@ -54,15 +52,15 @@ MAP_MODELS = [
 # Konfiguration – Ensemble-Diagramm (Station Ebringen)
 # ---------------------------------------------------------------------------
 
-DIAGRAM_GEOID = 141668     # Ebringen 79285 (DE), 48N 8E
-DIAGRAM_VAR = 4             # Niederschlag
+DIAGRAM_GEOID = 141668       # Ebringen 79285 (DE)
+DIAGRAM_VAR = 201             # Kombi: 850 hPa Temp. & Niederschlag
 DIAGRAM_STATION_LABEL = "Ebringen"
 DIAGRAM_URL = (
-    "https://wetterzentrale.de/de/show_diagrams.php"
-    "?geoid={geoid}&model={model}&var={var}&run={run:02d}&lid={lid}&bw=1"
+    "https://wetterzentrale.de/de/ens_image.php"
+    "?geoid={geoid}&var={var}&run={run:02d}&date={date}&model={model}&member={member}&bw=1"
 )
 
-# (Modellcode für show_diagrams.php, Anzeigename)
+# (Modellcode, Anzeigename)
 DIAGRAM_MODELS = [
     ("ecm", "ECMWF"),
     ("gfs", "GFS"),
@@ -80,14 +78,6 @@ def latest_run_slot(now_utc: datetime) -> datetime:
     return now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
 
 
-# ---------------------------------------------------------------------------
-# Teil 1: Gesamtkarten
-# ---------------------------------------------------------------------------
-
-def build_map_url(model: str, lid: str, run_dt: datetime) -> str:
-    return MAP_URL.format(model=model, lid=lid, run=run_dt.hour, time=FORECAST_HOUR, var=VAR_PRECIP)
-
-
 def image_exists(url: str) -> bool:
     """Prüft, ob unter der URL tatsächlich ein Bild liegt (statt einer Fehlerseite)."""
     try:
@@ -97,6 +87,14 @@ def image_exists(url: str) -> bool:
         return ok
     except requests.RequestException:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Teil 1: Gesamtkarten
+# ---------------------------------------------------------------------------
+
+def build_map_url(model: str, lid: str, run_dt: datetime) -> str:
+    return MAP_URL.format(model=model, lid=lid, run=run_dt.hour, time=FORECAST_HOUR, var=VAR_PRECIP)
 
 
 def find_latest_map(model: str, preferred_lid: str, now_utc: datetime):
@@ -137,131 +135,54 @@ def collect_maps(now_utc):
 
 
 # ---------------------------------------------------------------------------
-# Teil 2: Ensemble-Diagramm (Screenshot via Playwright)
+# Teil 2: Ensemble-Diagramm (statisches Bild von ens_image.php)
 # ---------------------------------------------------------------------------
 
-def build_diagram_caption(display_name: str, lid: str, run_dt: datetime) -> str:
-    kind = "Ensemble (alle Berechnungen inkl. Mittel/AVG)" if lid == "ENS" else "operationeller Lauf"
-    return (
-        f"{display_name} – {DIAGRAM_STATION_LABEL} – {kind}\n"
-        f"Lauf {run_dt.strftime('%d.%m.%Y %HZ')} · Niederschlag"
+def build_diagram_url(model: str, member: str, run_dt: datetime) -> str:
+    return DIAGRAM_URL.format(
+        geoid=DIAGRAM_GEOID,
+        var=DIAGRAM_VAR,
+        run=run_dt.hour,
+        date=run_dt.strftime("%Y-%m-%d"),
+        model=model,
+        member=member,
     )
 
 
-COOKIE_ACCEPT_TEXTS = [
-    "Zustimmen",
-    "Alle akzeptieren",
-    "Akzeptieren",
-    "Einverstanden",
-    "Accept all",
-    "Accept All",
-]
-
-
-def try_click_consent(page) -> bool:
-    """Ein Versuch: sucht in ALLEN Frames (auch iframes) nach einem Zustimmen-Button und klickt ihn."""
-    for frame in page.frames:
-        for text in COOKIE_ACCEPT_TEXTS:
-            try:
-                btn = frame.get_by_text(text, exact=False).first
-                if btn.is_visible(timeout=400):
-                    btn.click(timeout=1500, force=True)
-                    return True
-            except Exception as exc:  # noqa: BLE001
-                print(f"  (Klick-Versuch '{text}' in Frame {frame.url[:60]!r} fehlgeschlagen: {exc})")
-                continue
-    return False
-
-
-def dismiss_cookie_banner(page, attempts: int = 6, wait_between_ms: int = 1000) -> bool:
+def find_latest_diagram(model: str, now_utc: datetime):
     """
-    Best-effort: schließt ein Cookie-/Consent-Banner (z.B. Consentmanager), falls
-    eins da ist. Solche Banner werden oft erst kurz NACH dem eigentlichen
-    Seitenaufbau per JS eingeblendet (auch in einem eingebetteten iframe) -
-    deshalb wird mehrfach über ein paar Sekunden verteilt neu gesucht statt nur
-    einmal direkt nach dem Laden.
+    Sucht rückwärts (in 6h-Schritten) den neuesten Lauf, für den es das
+    Diagramm-Bild gibt. Versucht zuerst das Ensemble (member=ENS), fällt bei
+    Fehlschlag auf den operationellen Lauf (member=OP) zurück.
     """
-    for i in range(attempts):
-        if try_click_consent(page):
-            page.wait_for_timeout(800)
-            return True
-        page.wait_for_timeout(wait_between_ms)
-    return False
+    run_dt = latest_run_slot(now_utc)
+    for _ in range(MAX_RUN_FALLBACKS):
+        for member in ("ENS", "OP"):
+            url = build_diagram_url(model, member, run_dt)
+            if image_exists(url):
+                return url, member, run_dt
+        run_dt -= timedelta(hours=6)
+    return None, None, None
 
 
-def force_hide_overlays(page) -> int:
-    """
-    Letzter Rückfall, falls der Klick auf 'Zustimmen' nicht geklappt hat: entfernt
-    typische Cookie-/Consent-Overlay-Elemente (fest/absolut positioniert, mit
-    'cmp'/'consent'/'cookie' in id/class) direkt per JS aus dem DOM, damit der
-    Chart dahinter sichtbar wird.
-    """
-    js = """
-    () => {
-      const selectors = ['[id*="cmp" i]','[class*="cmp" i]','[id*="consent" i]',
-                          '[class*="consent" i]','[id*="cookie" i]','[class*="cookie" i]'];
-      let removed = 0;
-      for (const sel of selectors) {
-        document.querySelectorAll(sel).forEach(el => {
-          const style = window.getComputedStyle(el);
-          if (style.position === 'fixed' || style.position === 'absolute') {
-            el.remove();
-            removed++;
-          }
-        });
-      }
-      document.body.style.overflow = 'auto';
-      return removed;
-    }
-    """
-    try:
-        return page.evaluate(js)
-    except Exception as exc:  # noqa: BLE001
-        print(f"force_hide_overlays Fehler: {exc}")
-        return 0
-
-
-def screenshot_diagram(browser, model: str, run_dt: datetime, lid: str, out_path: str) -> bool:
-    url = DIAGRAM_URL.format(geoid=DIAGRAM_GEOID, model=model, var=DIAGRAM_VAR, run=run_dt.hour, lid=lid)
-    page = browser.new_page(viewport={"width": 1200, "height": 1200})
-    try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        dismissed = dismiss_cookie_banner(page)
-        print(f"Cookie-Banner bei {model}/{lid}: {'weggeklickt' if dismissed else 'per Klick NICHT gefunden'}")
-        if not dismissed:
-            removed = force_hide_overlays(page)
-            print(f"  Rückfall force_hide_overlays: {removed} Element(e) entfernt")
-        page.wait_for_timeout(5000)  # Chart-Rendering abwarten (nach Consent ggf. neu geladen)
-        page.screenshot(path=out_path, full_page=True)
-        size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
-        print(f"Diagramm-Screenshot {model}/{lid}: {size} Bytes ({url})")
-        return size > 15_000
-    except Exception as exc:  # noqa: BLE001
-        print(f"Diagramm-Fehler ({model}, {lid}, {url}): {exc}")
-        return False
-    finally:
-        page.close()
+def build_diagram_caption(display_name: str, member: str, run_dt: datetime) -> str:
+    kind = "Ensemble (alle Berechnungen inkl. Mittel/AVG)" if member == "ENS" else "operationeller Lauf"
+    return (
+        f"{display_name} – {DIAGRAM_STATION_LABEL} – {kind}\n"
+        f"Lauf {run_dt.strftime('%d.%m.%Y %HZ')} · 850hPa-Temp. & Niederschlag"
+    )
 
 
 def collect_diagrams(now_utc):
     items, missing = [], []
-    run_dt = latest_run_slot(now_utc)
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        for model_code, display_name in DIAGRAM_MODELS:
-            out_path = f"diagram_{model_code}.png"
-            used_lid = None
-            for lid in ("ENS", "OP"):
-                if screenshot_diagram(browser, model_code, run_dt, lid, out_path):
-                    used_lid = lid
-                    break
-            if used_lid:
-                items.append((out_path, build_diagram_caption(display_name, used_lid, run_dt)))
-                print(f"OK Diagramm: {display_name} ({used_lid})")
-            else:
-                missing.append(display_name)
-                print(f"WARNUNG: Kein Diagramm für {display_name} verfügbar.")
-        browser.close()
+    for model_code, display_name in DIAGRAM_MODELS:
+        url, member, run_dt = find_latest_diagram(model_code, now_utc)
+        if url is None:
+            missing.append(display_name)
+            print(f"WARNUNG: Kein Diagramm für {display_name} gefunden.")
+            continue
+        items.append((url, build_diagram_caption(display_name, member, run_dt)))
+        print(f"OK Diagramm: {display_name} -> {url}")
     return items, missing
 
 
@@ -282,43 +203,16 @@ def send_single_photo_url(url, caption):
     )
 
 
-def send_media_group_files(items):
-    media, files = [], {}
-    for i, (path, caption) in enumerate(items):
-        key = f"photo{i}"
-        files[key] = open(path, "rb")
-        media.append({"type": "photo", "media": f"attach://{key}", "caption": caption})
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
-    try:
-        return requests.post(
-            api_url, data={"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)}, files=files, timeout=60
-        )
-    finally:
-        for f in files.values():
-            f.close()
-
-
-def send_single_photo_file(path, caption):
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    with open(path, "rb") as f:
-        return requests.post(
-            api_url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"photo": f}, timeout=60
-        )
-
-
 def send_text(text):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     return requests.post(api_url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
 
 
-def send_group(items, url_based: bool, label: str) -> bool:
-    """Verschickt eine Gruppe von Items, meldet Erfolg/Misserfolg zurück."""
+def send_group(items, label: str) -> bool:
+    """Verschickt eine Gruppe von Bild-URLs als eine Telegram-Nachricht, meldet Erfolg zurück."""
     if not items:
         return False
-    if len(items) == 1:
-        resp = send_single_photo_url(*items[0]) if url_based else send_single_photo_file(*items[0])
-    else:
-        resp = send_media_group_urls(items) if url_based else send_media_group_files(items)
+    resp = send_single_photo_url(*items[0]) if len(items) == 1 else send_media_group_urls(items)
     print(f"Telegram-Antwort ({label}):", resp.status_code, resp.text[:500])
     return resp.status_code == 200
 
@@ -333,8 +227,8 @@ def main():
     map_items, map_missing = collect_maps(now_utc)
     diagram_items, diagram_missing = collect_diagrams(now_utc)
 
-    maps_ok = send_group(map_items, url_based=True, label="Karten")
-    diagrams_ok = send_group(diagram_items, url_based=False, label="Diagramme")
+    maps_ok = send_group(map_items, label="Karten")
+    diagrams_ok = send_group(diagram_items, label="Diagramme")
 
     missing = map_missing + diagram_missing
     if missing:
