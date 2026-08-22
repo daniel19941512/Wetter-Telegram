@@ -148,28 +148,32 @@ def build_diagram_caption(display_name: str, lid: str, run_dt: datetime) -> str:
     )
 
 
-COOKIE_ACCEPT_SELECTORS = [
-    "button:has-text('Alle akzeptieren')",
-    "button:has-text('Akzeptieren')",
-    "button:has-text('Zustimmen')",
-    "button:has-text('Einverstanden')",
-    "#cmpwelcomebtnyes",
-    ".cmpboxbtnyes",
-    "[aria-label='Accept all']",
+COOKIE_ACCEPT_TEXTS = [
+    "Zustimmen",
+    "Alle akzeptieren",
+    "Akzeptieren",
+    "Einverstanden",
+    "Accept all",
+    "Accept All",
 ]
 
 
-def dismiss_cookie_banner(page):
-    """Best-effort: schließt ein Cookie-/Consent-Banner, falls eins da ist."""
-    for selector in COOKIE_ACCEPT_SELECTORS:
-        try:
-            btn = page.locator(selector).first
-            if btn.is_visible(timeout=1500):
-                btn.click(timeout=1500)
-                page.wait_for_timeout(500)
-                return True
-        except Exception:  # noqa: BLE001
-            continue
+def dismiss_cookie_banner(page) -> bool:
+    """
+    Best-effort: schließt ein Cookie-/Consent-Banner (z.B. Consentmanager), falls
+    eins da ist. Solche Banner laufen oft in einem eingebetteten iframe, deshalb
+    wird über ALLE Frames der Seite gesucht, nicht nur über das Hauptdokument.
+    """
+    for frame in page.frames:
+        for text in COOKIE_ACCEPT_TEXTS:
+            try:
+                btn = frame.get_by_text(text, exact=False).first
+                if btn.is_visible(timeout=1000):
+                    btn.click(timeout=1500)
+                    page.wait_for_timeout(800)
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
     return False
 
 
@@ -178,8 +182,9 @@ def screenshot_diagram(browser, model: str, run_dt: datetime, lid: str, out_path
     page = browser.new_page(viewport={"width": 1200, "height": 1200})
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
-        dismiss_cookie_banner(page)
-        page.wait_for_timeout(4000)  # Chart-Rendering abwarten
+        dismissed = dismiss_cookie_banner(page)
+        print(f"Cookie-Banner bei {model}/{lid}: {'weggeklickt' if dismissed else 'keins gefunden'}")
+        page.wait_for_timeout(5000)  # Chart-Rendering abwarten (nach Consent ggf. neu geladen)
         page.screenshot(path=out_path, full_page=True)
         size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
         print(f"Diagramm-Screenshot {model}/{lid}: {size} Bytes ({url})")
