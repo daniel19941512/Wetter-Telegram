@@ -158,23 +158,67 @@ COOKIE_ACCEPT_TEXTS = [
 ]
 
 
-def dismiss_cookie_banner(page) -> bool:
-    """
-    Best-effort: schließt ein Cookie-/Consent-Banner (z.B. Consentmanager), falls
-    eins da ist. Solche Banner laufen oft in einem eingebetteten iframe, deshalb
-    wird über ALLE Frames der Seite gesucht, nicht nur über das Hauptdokument.
-    """
+def try_click_consent(page) -> bool:
+    """Ein Versuch: sucht in ALLEN Frames (auch iframes) nach einem Zustimmen-Button und klickt ihn."""
     for frame in page.frames:
         for text in COOKIE_ACCEPT_TEXTS:
             try:
                 btn = frame.get_by_text(text, exact=False).first
-                if btn.is_visible(timeout=1000):
-                    btn.click(timeout=1500)
-                    page.wait_for_timeout(800)
+                if btn.is_visible(timeout=400):
+                    btn.click(timeout=1500, force=True)
                     return True
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                print(f"  (Klick-Versuch '{text}' in Frame {frame.url[:60]!r} fehlgeschlagen: {exc})")
                 continue
     return False
+
+
+def dismiss_cookie_banner(page, attempts: int = 6, wait_between_ms: int = 1000) -> bool:
+    """
+    Best-effort: schließt ein Cookie-/Consent-Banner (z.B. Consentmanager), falls
+    eins da ist. Solche Banner werden oft erst kurz NACH dem eigentlichen
+    Seitenaufbau per JS eingeblendet (auch in einem eingebetteten iframe) -
+    deshalb wird mehrfach über ein paar Sekunden verteilt neu gesucht statt nur
+    einmal direkt nach dem Laden.
+    """
+    for i in range(attempts):
+        if try_click_consent(page):
+            page.wait_for_timeout(800)
+            return True
+        page.wait_for_timeout(wait_between_ms)
+    return False
+
+
+def force_hide_overlays(page) -> int:
+    """
+    Letzter Rückfall, falls der Klick auf 'Zustimmen' nicht geklappt hat: entfernt
+    typische Cookie-/Consent-Overlay-Elemente (fest/absolut positioniert, mit
+    'cmp'/'consent'/'cookie' in id/class) direkt per JS aus dem DOM, damit der
+    Chart dahinter sichtbar wird.
+    """
+    js = """
+    () => {
+      const selectors = ['[id*="cmp" i]','[class*="cmp" i]','[id*="consent" i]',
+                          '[class*="consent" i]','[id*="cookie" i]','[class*="cookie" i]'];
+      let removed = 0;
+      for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach(el => {
+          const style = window.getComputedStyle(el);
+          if (style.position === 'fixed' || style.position === 'absolute') {
+            el.remove();
+            removed++;
+          }
+        });
+      }
+      document.body.style.overflow = 'auto';
+      return removed;
+    }
+    """
+    try:
+        return page.evaluate(js)
+    except Exception as exc:  # noqa: BLE001
+        print(f"force_hide_overlays Fehler: {exc}")
+        return 0
 
 
 def screenshot_diagram(browser, model: str, run_dt: datetime, lid: str, out_path: str) -> bool:
@@ -183,7 +227,10 @@ def screenshot_diagram(browser, model: str, run_dt: datetime, lid: str, out_path
     try:
         page.goto(url, wait_until="networkidle", timeout=30000)
         dismissed = dismiss_cookie_banner(page)
-        print(f"Cookie-Banner bei {model}/{lid}: {'weggeklickt' if dismissed else 'keins gefunden'}")
+        print(f"Cookie-Banner bei {model}/{lid}: {'weggeklickt' if dismissed else 'per Klick NICHT gefunden'}")
+        if not dismissed:
+            removed = force_hide_overlays(page)
+            print(f"  Rückfall force_hide_overlays: {removed} Element(e) entfernt")
         page.wait_for_timeout(5000)  # Chart-Rendering abwarten (nach Consent ggf. neu geladen)
         page.screenshot(path=out_path, full_page=True)
         size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
