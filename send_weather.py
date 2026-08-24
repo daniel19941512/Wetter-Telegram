@@ -29,6 +29,7 @@ Benötigte Umgebungsvariablen (als GitHub Secrets):
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
@@ -101,11 +102,39 @@ def latest_run_slot(now_utc: datetime) -> datetime:
     return now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
 
 
-def image_exists(url: str) -> bool:
-    """Prüft, ob unter der URL tatsächlich ein Bild liegt (statt einer Fehlerseite)."""
+def image_exists(url: str, expected_run_dt: datetime = None) -> bool:
+    """
+    Prüft, ob unter der URL tatsächlich ein Bild liegt (statt einer Fehlerseite).
+
+    WICHTIG: Die Kartei-Bilder (MAP_URL) enthalten KEIN Datum im Dateinamen, nur
+    die Laufzeit (z.B. "...ME12_0_2.png") - dieselbe Datei wird jeden Tag am
+    selben Pfad überschrieben. Ein reiner Status-200-Check reicht deshalb nicht:
+    falls wetterzentrale.de die Datei mal nicht neu erzeugt hat, sähe die alte
+    Datei von vor Tagen identisch "gültig" aus. Deshalb wird zusätzlich der
+    Last-Modified-Header geprüft, falls expected_run_dt angegeben ist - liegt er
+    vor dem angefragten Lauf, gilt die Datei als (noch) nicht aktuell.
+    """
     try:
         r = requests.get(url, timeout=20, stream=True)
         ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image")
+        if ok and expected_run_dt is not None:
+            last_mod_raw = r.headers.get("Last-Modified")
+            if last_mod_raw:
+                try:
+                    lm_dt = parsedate_to_datetime(last_mod_raw)
+                    if lm_dt.tzinfo is None:
+                        lm_dt = lm_dt.replace(tzinfo=timezone.utc)
+                    # 1h Toleranz, falls die Datei kurz vor dem offiziellen Lauf-Zeitstempel erzeugt wurde
+                    if lm_dt < expected_run_dt - timedelta(hours=1):
+                        print(
+                            f"  (verworfen, veraltet: Last-Modified {lm_dt.isoformat()} "
+                            f"vor Lauf {expected_run_dt.isoformat()} -> {url})"
+                        )
+                        ok = False
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  (Last-Modified '{last_mod_raw}' nicht parsebar: {exc})")
+            else:
+                print(f"  (kein Last-Modified-Header vorhanden für {url} - Freshness ungeprüft)")
         r.close()
         return ok
     except requests.RequestException:
@@ -130,7 +159,7 @@ def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_hour
     for _ in range(MAX_RUN_FALLBACKS):
         for lid in dict.fromkeys([preferred_lid, "OP"]):  # preferred zuerst, Duplikate raus
             url = build_map_url(model, lid, run_dt, time_hour, var)
-            if image_exists(url):
+            if image_exists(url, expected_run_dt=run_dt):
                 return url, lid, run_dt
         run_dt -= timedelta(hours=6)
     return None, None, None
