@@ -29,6 +29,17 @@ Teil 2 – Ensemble-Diagramm für Ebringen (statisches Bild):
   Lauf, sofern das Modell Ensemble-Daten anbietet (member=ENS). Falls nicht,
   Rückfall auf den operationellen Lauf (member=OP).
 
+Teil 1 (Fortsetzung) – zusätzliche Kartentypen: Windböen (var=19), Schneehöhe
+  (var=25), Gewitterindex/CAPE (var=11) - gleiches Schema, nicht bei allen 4
+  Modellen verfügbar (siehe README).
+
+Teil 3 – DWD-Regenradar (aktuelles Kompositbild, siehe weather_summary.py).
+
+Teil 4 – Textzusammenfassung (siehe weather_summary.py): DWD-Unwetterwarnungen,
+  Zahlen-Modellvergleich, Schwellenwert-Hinweis, Modell-Trefferquote (Vorhersage
+  vs. tatsächlich eingetroffenes Wetter) - über die freien APIs von Open-Meteo
+  und Bright Sky (unabhängig von wetterzentrale.de, da die nur Bilder liefert).
+
 Benötigte Umgebungsvariablen (als GitHub Secrets):
   TELEGRAM_BOT_TOKEN
   TELEGRAM_CHAT_ID
@@ -40,6 +51,8 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 import requests
+
+import weather_summary
 
 # ---------------------------------------------------------------------------
 # Konfiguration – Gesamtkarten (mehrere "Produkte" möglich)
@@ -80,6 +93,40 @@ MAP_PRODUCTS = [
             ("GFS", "GFS", "OP"),
             ("ICO", "ICON", "OP"),
             ("AIFS", "AIFS", "OP"),
+        ],
+    },
+    {
+        "key": "windboeen",
+        "var": 19,     # Windböen ("Spitzenwind")
+        "time_candidates": [144, 120, 96, 72, 48, 24],
+        "label_tpl": "Windböen bis +{time}h · Mitteleuropa",
+        # AIFS bietet auf wetterzentrale.de keine Windböen-Karte an -> weggelassen
+        "models": [
+            ("ECM", "ECMWF", "OP"),
+            ("GFS", "GFS", "OP"),
+            ("ICO", "ICON", "OP"),
+        ],
+    },
+    {
+        "key": "schnee",
+        "var": 25,     # Gesamtschneehöhe
+        "time_candidates": [144, 120, 96, 72, 48, 24],
+        "label_tpl": "Schneehöhe (gesamt) bis +{time}h · Mitteleuropa",
+        # nur GFS und ICON bieten diese Karte auf wetterzentrale.de an
+        "models": [
+            ("GFS", "GFS", "OP"),
+            ("ICO", "ICON", "OP"),
+        ],
+    },
+    {
+        "key": "gewitter_cape",
+        "var": 11,     # CAPE/LI (Gewitterindex)
+        "time_candidates": [144, 120, 96, 72, 48, 24],
+        "label_tpl": "Gewitterindex (CAPE/LI) bis +{time}h · Mitteleuropa",
+        # nur GFS und ICON bieten diese Karte auf wetterzentrale.de an
+        "models": [
+            ("GFS", "GFS", "OP"),
+            ("ICO", "ICON", "OP"),
         ],
     },
 ]
@@ -306,6 +353,16 @@ def send_single_photo_url(url, caption):
     )
 
 
+def send_photo_bytes(img_bytes: bytes, caption: str):
+    """Wie send_single_photo_url, aber lädt die Bild-Bytes direkt hoch statt
+    nur eine URL zu übergeben - für Quellen, bei denen Telegrams eigener
+    Bild-Abruf blockiert werden könnte."""
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("bild.jpg", img_bytes)}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+    return requests.post(api_url, data=data, files=files, timeout=30)
+
+
 def send_text(text):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     return requests.post(api_url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=30)
@@ -341,6 +398,31 @@ def main():
     missing += diagram_missing
     any_items = any_items or bool(diagram_items)
     any_sent = send_group(diagram_items, label="Diagramme") or any_sent
+
+    # DWD-Regenradar (eigenständiges Bild, kein wetterzentrale-Modell)
+    radar_bytes = weather_summary.fetch_dwd_radar_bytes(cache_buster=int(now_utc.timestamp()))
+    if radar_bytes:
+        resp = send_photo_bytes(radar_bytes, "DWD-Regenradar Deutschland (aktuell)")
+        print("Telegram-Antwort (Radar):", resp.status_code, resp.text[:300])
+        any_items = True
+        any_sent = (resp.status_code == 200) or any_sent
+    else:
+        missing.append("DWD-Regenradar")
+
+    # Text-Zusammenfassung: DWD-Warnungen, Modellvergleich, Schwellenwert-Hinweis,
+    # Modell-Trefferquote (siehe weather_summary.py)
+    try:
+        summary_text = weather_summary.build_summary_message()
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNUNG: Zusammenfassung fehlgeschlagen: {exc}")
+        summary_text = None
+    if summary_text:
+        resp = send_text(summary_text)
+        print("Telegram-Antwort (Zusammenfassung):", resp.status_code, resp.text[:300])
+        any_items = True
+        any_sent = (resp.status_code == 200) or any_sent
+    else:
+        print("WARNUNG: Keine Zusammenfassung verfügbar (siehe [Diagnose]-Zeilen oben).")
 
     if missing:
         send_text(f"ℹ️ Hinweis: Für folgende Modelle/Produkte war gerade nichts Aktuelles verfügbar: {', '.join(missing)}")
