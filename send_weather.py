@@ -3,15 +3,23 @@
 Schickt 3x täglich (per GitHub Actions Cron) aktuelle Niederschlags-Informationen
 von wetterzentrale.de für ECMWF, GFS, ICON und AIFS an einen Telegram-Chat.
 
+Lauf-Auswahl: Es wird IMMER der 18Z-Lauf verwendet (TARGET_RUN_HOUR) - der
+  heutige, sobald wetterzentrale.de ihn bereitgestellt hat, bis dahin der von
+  gestern. Das heißt: bei den früheren der 3 täglichen Sendungen (z.B. 06/12
+  Uhr UTC) zeigt der Bot noch den 18Z-Lauf von GESTERN, ab dem Abend dann den
+  heutigen. Damit ist immer klar, welcher Lauf gemeint ist, statt bei jeder
+  Sendung einen anderen der 4 Tagesläufe zu zeigen.
+
 Teil 1 – Gesamtkarten (statische Bilder), siehe MAP_PRODUCTS:
   a) Gesamt-Niederschlagssumme (var=18), Region Mitteleuropa (map=3),
-     Vorhersagestunde +144h (6 Tage). Für GFS wird das echte Ensemble-Mittel
-     (Member "AVG") verwendet, da wetterzentrale.de das auf dieser Karte nur
-     für GFS anbietet. Bei ECMWF, ICON und AIFS gibt es dort kein
-     Ensemble-Mittel für diese Karte -> operationeller Lauf.
+     Vorhersagestunde so weit wie möglich (siehe time_candidates - probiert
+     von der längsten Vorhersagestunde absteigend, welche das jeweilige
+     Modell/Lauf tatsächlich anbietet, mit 144h als garantierter Rückfall).
+     Für GFS wird das echte Ensemble-Mittel (Member "AVG") verwendet, da
+     wetterzentrale.de das auf dieser Karte nur für GFS anbietet. Bei ECMWF,
+     ICON und AIFS gibt es dort kein Ensemble-Mittel für diese Karte ->
+     operationeller Lauf.
   b) 850 hPa Temperatur (var=2), Region Mitteleuropa, aktueller Lauf (time=0).
-  Jeweils der aktuellste verfügbare Modelllauf (00/06/12/18Z, automatisch
-  anhand der aktuellen UTC-Zeit ermittelt).
 
 Teil 2 – Ensemble-Diagramm für Ebringen (statisches Bild):
   Nutzt den Server-Endpunkt ens_image.php (Kombi-Chart "850 hPa Temp. &
@@ -38,19 +46,23 @@ import requests
 # ---------------------------------------------------------------------------
 
 MAP_REGION = 3        # Mitteleuropa
-MAX_RUN_FALLBACKS = 6    # wie viele 6h-Schritte zurück probiert werden, falls noch nichts da ist
+TARGET_RUN_HOUR = 18    # bevorzugter Lauf: immer der 18Z-Lauf (heutiger, sobald verfügbar)
+MAX_DAY_FALLBACKS = 3    # wie viele Tage zurück probiert werden, falls der 18Z-Lauf noch fehlt
 
 MAP_URL = "https://wetterzentrale.de/maps/{model}{lid}ME{run:02d}_{time}_{var}.png"
 
-# Jedes Produkt: var/time (siehe wetterzentrale.de Top Karten) + welches Member je
-# Modell bevorzugt wird ("AVG" = Ensemble-Mittel, "OP" = operationeller Lauf; bei
-# einem Modell ohne AVG fällt das Skript automatisch auf OP zurück).
+# Jedes Produkt: var + Liste möglicher Vorhersagestunden ("time_candidates", längste
+# zuerst - das Skript nimmt die längste, die tatsächlich verfügbar ist) + welches
+# Member je Modell bevorzugt wird ("AVG" = Ensemble-Mittel, "OP" = operationeller
+# Lauf; bei einem Modell ohne AVG fällt das Skript automatisch auf OP zurück).
 MAP_PRODUCTS = [
     {
         "key": "precip_total",
         "var": 18,     # Gesamt-Niederschlagssumme
-        "time": 144,     # +144h (6 Tage)
-        "label": "Gesamt-Niederschlag bis +144h · Mitteleuropa",
+        # so weit wie möglich, absteigend probiert (deckt GFS/AIFS/ICON-Langfrist
+        # sowie ECMWF-Kurzläufe ab, die z.B. beim 18Z-Lauf oft nur bis 144h gehen)
+        "time_candidates": [384, 360, 240, 180, 168, 144],
+        "label_tpl": "Gesamt-Niederschlag bis +{time}h · Mitteleuropa",
         "models": [
             ("ECM", "ECMWF", "OP"),
             ("GFS", "GFS", "AVG"),
@@ -61,8 +73,8 @@ MAP_PRODUCTS = [
     {
         "key": "temp850",
         "var": 2,      # 850 hPa Temperatur
-        "time": 0,      # aktueller Lauf (Analyse, kein Forecast-Offset)
-        "label": "850 hPa Temperatur (aktueller Lauf) · Mitteleuropa",
+        "time_candidates": [0],  # aktueller Lauf (Analyse, kein Forecast-Offset)
+        "label_tpl": "850 hPa Temperatur (aktueller Lauf) · Mitteleuropa",
         "models": [
             ("ECM", "ECMWF", "OP"),
             ("GFS", "GFS", "OP"),
@@ -96,13 +108,21 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
-def latest_run_slot(now_utc: datetime) -> datetime:
-    """Rundet auf den letzten 00/06/12/18Z-Slot ab."""
-    hour = (now_utc.hour // 6) * 6
-    return now_utc.replace(hour=hour, minute=0, second=0, microsecond=0)
+def latest_target_run_slot(now_utc: datetime, target_hour: int = TARGET_RUN_HOUR) -> datetime:
+    """
+    Liefert den letzten TARGET_RUN_HOUR-Lauf (Standard: 18Z) - den heutigen, falls
+    der Zeitpunkt schon erreicht ist, sonst den von gestern. Ein Aufruf um 08:00 UTC
+    liefert also den 18Z-Lauf von GESTERN (heutiger 18Z existiert ja noch nicht);
+    ein Aufruf um 20:00 UTC liefert (sobald von wetterzentrale.de bereitgestellt)
+    den heutigen 18Z-Lauf.
+    """
+    candidate = now_utc.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    if candidate > now_utc:
+        candidate -= timedelta(days=1)
+    return candidate
 
 
-MAX_STALENESS_HOURS = 30  # Datei muss innerhalb dieses Fensters ab JETZT aktualisiert worden sein
+MAX_STALENESS_HOURS = 33  # Datei muss innerhalb dieses Fensters ab JETZT aktualisiert worden sein
 
 
 def image_exists(url: str, now_utc: datetime = None) -> bool:
@@ -157,20 +177,22 @@ def build_map_url(model: str, lid: str, run_dt: datetime, time_hour: int, var: i
     return MAP_URL.format(model=model, lid=lid, run=run_dt.hour, time=time_hour, var=var)
 
 
-def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_hour: int, var: int):
+def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_candidates, var: int):
     """
-    Sucht rückwärts (in 6h-Schritten) den neuesten Lauf, für den es tatsächlich
-    ein Kartenbild gibt. Versucht zuerst das bevorzugte Member (z.B. AVG), fällt
-    bei Fehlschlag auf "OP" zurück.
+    Sucht den TARGET_RUN_HOUR-Lauf (Standard 18Z) - den heutigen, sonst tageweise
+    rückwärts bis zu MAX_DAY_FALLBACKS Tage. Für jeden Lauf: erst das bevorzugte
+    Member (z.B. AVG), sonst "OP"; für jedes Member werden die time_candidates
+    von der LÄNGSTEN Vorhersagestunde absteigend probiert - "so weit wie möglich".
     """
-    run_dt = latest_run_slot(now_utc)
-    for _ in range(MAX_RUN_FALLBACKS):
+    run_dt = latest_target_run_slot(now_utc)
+    for _ in range(MAX_DAY_FALLBACKS):
         for lid in dict.fromkeys([preferred_lid, "OP"]):  # preferred zuerst, Duplikate raus
-            url = build_map_url(model, lid, run_dt, time_hour, var)
-            if image_exists(url, now_utc=now_utc):
-                return url, lid, run_dt
-        run_dt -= timedelta(hours=6)
-    return None, None, None
+            for time_hour in time_candidates:
+                url = build_map_url(model, lid, run_dt, time_hour, var)
+                if image_exists(url, now_utc=now_utc):
+                    return url, lid, run_dt, time_hour
+        run_dt -= timedelta(days=1)
+    return None, None, None, None
 
 
 def build_map_caption(display_name: str, lid: str, run_dt: datetime, label: str) -> str:
@@ -181,15 +203,16 @@ def build_map_caption(display_name: str, lid: str, run_dt: datetime, label: str)
 def collect_maps(product: dict, now_utc):
     items, missing = [], []
     for model_code, display_name, preferred_lid in product["models"]:
-        url, lid, run_dt = find_latest_map(
-            model_code, preferred_lid, now_utc, product["time"], product["var"]
+        url, lid, run_dt, time_hour = find_latest_map(
+            model_code, preferred_lid, now_utc, product["time_candidates"], product["var"]
         )
         if url is None:
             missing.append(f"{display_name} ({product['key']})")
             print(f"WARNUNG: Keine aktuelle Karte für {display_name} ({product['key']}) gefunden.")
             continue
-        items.append((url, build_map_caption(display_name, lid, run_dt, product["label"])))
-        print(f"OK Karte [{product['key']}]: {display_name} -> {url}")
+        label = product["label_tpl"].format(time=time_hour)
+        items.append((url, build_map_caption(display_name, lid, run_dt, label)))
+        print(f"OK Karte [{product['key']}]: {display_name} (+{time_hour}h) -> {url}")
     return items, missing
 
 
@@ -210,17 +233,18 @@ def build_diagram_url(model: str, member: str, run_dt: datetime) -> str:
 
 def find_latest_diagram(model: str, now_utc: datetime):
     """
-    Sucht rückwärts (in 6h-Schritten) den neuesten Lauf, für den es das
-    Diagramm-Bild gibt. Versucht zuerst das Ensemble (member=ENS), fällt bei
-    Fehlschlag auf den operationellen Lauf (member=OP) zurück.
+    Sucht den TARGET_RUN_HOUR-Lauf (Standard 18Z) - den heutigen, sonst tageweise
+    rückwärts. Versucht zuerst das Ensemble (member=ENS), fällt bei Fehlschlag auf
+    den operationellen Lauf (member=OP) zurück. Die Diagramm-URL enthält bereits
+    ein explizites Datum, daher ist hier kein zusätzlicher Last-Modified-Check nötig.
     """
-    run_dt = latest_run_slot(now_utc)
-    for _ in range(MAX_RUN_FALLBACKS):
+    run_dt = latest_target_run_slot(now_utc)
+    for _ in range(MAX_DAY_FALLBACKS):
         for member in ("ENS", "OP"):
             url = build_diagram_url(model, member, run_dt)
             if image_exists(url):
                 return url, member, run_dt
-        run_dt -= timedelta(hours=6)
+        run_dt -= timedelta(days=1)
     return None, None, None
 
 
