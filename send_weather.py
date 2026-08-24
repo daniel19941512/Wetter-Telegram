@@ -124,6 +124,23 @@ def latest_target_run_slot(now_utc: datetime, target_hour: int = TARGET_RUN_HOUR
 
 MAX_STALENESS_HOURS = 33  # Datei muss innerhalb dieses Fensters ab JETZT aktualisiert worden sein
 
+# Wird an jede Bild-URL angehängt: erzwingt, dass wir (und Telegram beim Abholen
+# der URL) nicht an einer von einem CDN/Proxy zwischengespeicherten alten Version
+# der immer gleichen, datumslosen Bild-URL hängen bleiben. Grund für den Fix:
+# Die HTML-Übersichtsseite (topkarten.php) meldete für die 850hPa-Temperaturkarte
+# bereits den korrekten, aktuellen Lauf - das direkt abgerufene PNG unter derselben
+# Pfad-URL zeigte trotzdem tagealte Daten. Das deutet auf eine zwischengespeicherte
+# Kopie hin, nicht auf ein falsch berechnetes Datum.
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+
+def _bust_cache(url: str, now_utc: datetime) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_cb={int(now_utc.timestamp())}"
+
 
 def image_exists(url: str, now_utc: datetime = None) -> bool:
     """
@@ -132,22 +149,24 @@ def image_exists(url: str, now_utc: datetime = None) -> bool:
     WICHTIG: Die Kartei-Bilder (MAP_URL) enthalten KEIN Datum im Dateinamen, nur
     die Laufzeit (z.B. "...ME12_0_2.png") - dieselbe Datei wird jeden Tag am
     selben Pfad überschrieben. Ein reiner Status-200-Check reicht deshalb nicht:
-    falls wetterzentrale.de die Datei mal nicht neu erzeugt hat, sähe die alte
-    Datei von vor Tagen identisch "gültig" aus.
+    falls wetterzentrale.de die Datei mal nicht neu erzeugt hat (oder ein
+    zwischengeschalteter Cache eine alte Kopie ausliefert), sähe die alte Datei
+    von vor Tagen identisch "gültig" aus. Deshalb zwei Schutzschichten:
 
-    Deshalb wird der Last-Modified-Header gegen die TATSÄCHLICHE aktuelle Zeit
-    (now_utc) geprüft, NICHT gegen den gerade getesteten Kandidaten-Lauf - sonst
-    würde die Rückwärtssuche einfach so lange zurücklaufen, bis eine uralte
-    Datei "zufällig" wieder zu einem alten Kandidaten-Lauf passt. Ist die Datei
-    seit mehr als MAX_STALENESS_HOURS nicht aktualisiert worden, gilt sie als
-    nicht verfügbar - unabhängig davon, welchen Lauf wir gerade probieren.
+    1. Cache-Busting: eindeutiger Query-Parameter + No-Cache-Header bei jedem
+       Abruf, damit eine evtl. zwischengespeicherte alte Kopie umgangen wird.
+    2. Last-Modified-Check gegen die TATSÄCHLICHE aktuelle Zeit (now_utc), NICHT
+       gegen den gerade getesteten Kandidaten-Lauf - sonst würde die Rückwärts-
+       suche einfach so lange zurücklaufen, bis eine uralte Datei "zufällig"
+       wieder zu einem alten Kandidaten-Lauf passt.
     """
     try:
-        r = requests.get(url, timeout=20, stream=True)
+        r = requests.get(url, headers=NO_CACHE_HEADERS, timeout=20, stream=True)
         ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image")
-        if ok and now_utc is not None:
+        if now_utc is not None:
             last_mod_raw = r.headers.get("Last-Modified")
-            if last_mod_raw:
+            print(f"  [Last-Modified-Check] status={r.status_code} Last-Modified='{last_mod_raw}' -> {url}")
+            if ok and last_mod_raw:
                 try:
                     lm_dt = parsedate_to_datetime(last_mod_raw)
                     if lm_dt.tzinfo is None:
@@ -161,8 +180,6 @@ def image_exists(url: str, now_utc: datetime = None) -> bool:
                         ok = False
                 except Exception as exc:  # noqa: BLE001
                     print(f"  (Last-Modified '{last_mod_raw}' nicht parsebar: {exc})")
-            else:
-                print(f"  (kein Last-Modified-Header vorhanden für {url} - Freshness ungeprüft)")
         r.close()
         return ok
     except requests.RequestException:
@@ -173,8 +190,9 @@ def image_exists(url: str, now_utc: datetime = None) -> bool:
 # Teil 1: Gesamtkarten
 # ---------------------------------------------------------------------------
 
-def build_map_url(model: str, lid: str, run_dt: datetime, time_hour: int, var: int) -> str:
-    return MAP_URL.format(model=model, lid=lid, run=run_dt.hour, time=time_hour, var=var)
+def build_map_url(model: str, lid: str, run_dt: datetime, time_hour: int, var: int, now_utc: datetime) -> str:
+    base = MAP_URL.format(model=model, lid=lid, run=run_dt.hour, time=time_hour, var=var)
+    return _bust_cache(base, now_utc)
 
 
 def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_candidates, var: int):
@@ -188,7 +206,7 @@ def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_cand
     for _ in range(MAX_DAY_FALLBACKS):
         for lid in dict.fromkeys([preferred_lid, "OP"]):  # preferred zuerst, Duplikate raus
             for time_hour in time_candidates:
-                url = build_map_url(model, lid, run_dt, time_hour, var)
+                url = build_map_url(model, lid, run_dt, time_hour, var, now_utc)
                 if image_exists(url, now_utc=now_utc):
                     return url, lid, run_dt, time_hour
         run_dt -= timedelta(days=1)
@@ -220,8 +238,8 @@ def collect_maps(product: dict, now_utc):
 # Teil 2: Ensemble-Diagramm (statisches Bild von ens_image.php)
 # ---------------------------------------------------------------------------
 
-def build_diagram_url(model: str, member: str, run_dt: datetime) -> str:
-    return DIAGRAM_URL.format(
+def build_diagram_url(model: str, member: str, run_dt: datetime, now_utc: datetime) -> str:
+    base = DIAGRAM_URL.format(
         geoid=DIAGRAM_GEOID,
         var=DIAGRAM_VAR,
         run=run_dt.hour,
@@ -229,6 +247,7 @@ def build_diagram_url(model: str, member: str, run_dt: datetime) -> str:
         model=model,
         member=member,
     )
+    return _bust_cache(base, now_utc)
 
 
 def find_latest_diagram(model: str, now_utc: datetime):
@@ -236,12 +255,13 @@ def find_latest_diagram(model: str, now_utc: datetime):
     Sucht den TARGET_RUN_HOUR-Lauf (Standard 18Z) - den heutigen, sonst tageweise
     rückwärts. Versucht zuerst das Ensemble (member=ENS), fällt bei Fehlschlag auf
     den operationellen Lauf (member=OP) zurück. Die Diagramm-URL enthält bereits
-    ein explizites Datum, daher ist hier kein zusätzlicher Last-Modified-Check nötig.
+    ein explizites Datum; Cache-Busting wird trotzdem angewendet, für den Fall,
+    dass auch dieser Endpunkt hinter einem Cache liegt.
     """
     run_dt = latest_target_run_slot(now_utc)
     for _ in range(MAX_DAY_FALLBACKS):
         for member in ("ENS", "OP"):
-            url = build_diagram_url(model, member, run_dt)
+            url = build_diagram_url(model, member, run_dt, now_utc)
             if image_exists(url):
                 return url, member, run_dt
         run_dt -= timedelta(days=1)
