@@ -133,10 +133,22 @@ def fetch_dwd_warning_text():
 # ---------------------------------------------------------------------------
 
 def fetch_comparison_data():
+    """
+    Eine gemeinsame Open-Meteo-Anfrage für den Modellvergleich (Abschnitt 2)
+    UND die gemittelte Tagesübersicht (Abschnitt 2b, siehe weiter unten) - spart
+    einen zweiten Request. 'daily' liefert die Tageswerte direkt je Modell,
+    'hourly' wird für Taupunkt und CAPE gebraucht, da es dafür keine fertigen
+    Tageswerte in der Open-Meteo-API gibt - die werden weiter unten selbst aus
+    den Stundenwerten pro Tag gemittelt.
+    """
     params = {
         "latitude": EBRINGEN_LAT,
         "longitude": EBRINGEN_LON,
-        "daily": "precipitation_sum,temperature_2m_max,temperature_2m_min,wind_gusts_10m_max",
+        "daily": (
+            "precipitation_sum,temperature_2m_max,temperature_2m_min,"
+            "wind_gusts_10m_max,sunshine_duration"
+        ),
+        "hourly": "dew_point_2m,cape",
         "models": ",".join(OPEN_METEO_MODELS.values()),
         "timezone": "Europe/Berlin",
         "forecast_days": 3,
@@ -207,6 +219,110 @@ def build_comparison_and_alert(data: dict):
     alert_text = "\n".join(alert_lines) if alert_lines else None
 
     return comparison_text, alert_text
+
+
+# ---------------------------------------------------------------------------
+# 2b. Gemittelte Tagesübersicht (heute + morgen, Mittel über alle Modelle)
+# ---------------------------------------------------------------------------
+
+DAY_LABELS = ["Heute", "Morgen"]
+
+
+def _day_hour_indices(hourly_times, day_date: str):
+    """Indizes aller Stundenwerte, die zu einem bestimmten Kalendertag gehören
+    (hourly_times sind ISO-Zeitstempel wie '2026-08-25T14:00')."""
+    return [i for i, t in enumerate(hourly_times) if t.startswith(day_date)]
+
+
+def _avg(values):
+    values = [v for v in values if isinstance(v, (int, float))]
+    return sum(values) / len(values) if values else None
+
+
+def build_daily_overview_text(data: dict):
+    """
+    Baut eine zusätzliche, kompakte Übersicht für heute + morgen - jeweils
+    über alle 4 Modelle GEMITTELT (nicht je Modell einzeln wie beim
+    Modellvergleich oben): Min/Max-Temperatur, Niederschlag, Sonnenscheindauer,
+    Taupunkt, Windböen, CAPE. Taupunkt und CAPE gibt es bei Open-Meteo nur als
+    Stundenwerte (nicht als fertigen Tageswert) - werden hier je Modell über
+    den Tag gemittelt und dann über die Modelle gemittelt.
+    """
+    if not data or "daily" not in data or "hourly" not in data:
+        return None
+    daily = data["daily"]
+    hourly = data["hourly"]
+    daily_times = daily.get("time", [])
+    hourly_times = hourly.get("time", [])
+    if len(daily_times) < 2 or not hourly_times:
+        return None
+
+    lines = ["🌤️ Tagesübersicht Ebringen (Mittel aller Modelle)"]
+    any_day_found = False
+
+    for day_idx in range(min(2, len(daily_times))):
+        day_date = daily_times[day_idx]
+        tmax_vals, tmin_vals, precip_vals, sun_vals, gust_vals = [], [], [], [], []
+        dewpoint_vals, cape_vals = [], []
+        day_hour_idx = _day_hour_indices(hourly_times, day_date)
+
+        for model_id in OPEN_METEO_MODELS.values():
+            k_tmax = _find_key(daily, "temperature_2m_max", model_id)
+            k_tmin = _find_key(daily, "temperature_2m_min", model_id)
+            k_precip = _find_key(daily, "precipitation_sum", model_id)
+            k_sun = _find_key(daily, "sunshine_duration", model_id)
+            k_gust = _find_key(daily, "wind_gusts_10m_max", model_id)
+            k_dew = _find_key(hourly, "dew_point_2m", model_id)
+            k_cape = _find_key(hourly, "cape", model_id)
+
+            if k_tmax and daily.get(k_tmax) and isinstance(daily[k_tmax][day_idx], (int, float)):
+                tmax_vals.append(daily[k_tmax][day_idx])
+            if k_tmin and daily.get(k_tmin) and isinstance(daily[k_tmin][day_idx], (int, float)):
+                tmin_vals.append(daily[k_tmin][day_idx])
+            if k_precip and daily.get(k_precip) and isinstance(daily[k_precip][day_idx], (int, float)):
+                precip_vals.append(daily[k_precip][day_idx])
+            if k_sun and daily.get(k_sun) and isinstance(daily[k_sun][day_idx], (int, float)):
+                sun_vals.append(daily[k_sun][day_idx])
+            if k_gust and daily.get(k_gust) and isinstance(daily[k_gust][day_idx], (int, float)):
+                gust_vals.append(daily[k_gust][day_idx])
+
+            if k_dew:
+                dew_avg = _avg(hourly[k_dew][i] for i in day_hour_idx)
+                if dew_avg is not None:
+                    dewpoint_vals.append(dew_avg)
+            if k_cape:
+                cape_avg = _avg(hourly[k_cape][i] for i in day_hour_idx)
+                if cape_avg is not None:
+                    cape_vals.append(cape_avg)
+
+        tmax, tmin = _avg(tmax_vals), _avg(tmin_vals)
+        precip, gust = _avg(precip_vals), _avg(gust_vals)
+        sun_h = _avg(sun_vals) / 3600 if _avg(sun_vals) is not None else None
+        dew, cape = _avg(dewpoint_vals), _avg(cape_vals)
+
+        if all(v is None for v in (tmax, tmin, precip, sun_h, gust, dew, cape)):
+            print(f"  [Diagnose/Tagesübersicht] Keine Werte für Tag {day_date} gefunden.")
+            continue
+        any_day_found = True
+
+        label = DAY_LABELS[day_idx] if day_idx < len(DAY_LABELS) else day_date
+        lines.append(f"\n📅 {label}")
+        if tmin is not None and tmax is not None:
+            lines.append(f"🌡️ Min/Max: {tmin:.0f}°C / {tmax:.0f}°C")
+        if precip is not None:
+            lines.append(f"☔ Niederschlag: {precip:.0f}mm")
+        if sun_h is not None:
+            lines.append(f"☀️ Sonnenschein: {sun_h:.1f}h")
+        if dew is not None:
+            lines.append(f"💧 Taupunkt (Ø): {dew:.0f}°C")
+        if gust is not None:
+            lines.append(f"💨 Böen (max.): {gust:.0f}km/h")
+        if cape is not None:
+            lines.append(f"⛈️ CAPE (Ø): {cape:.0f} J/kg")
+
+    if not any_day_found:
+        return None
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +480,11 @@ def build_summary_message():
         sections.append(warning_text)
 
     comparison_data = fetch_comparison_data()
+
+    overview_text = build_daily_overview_text(comparison_data)
+    if overview_text:
+        sections.append(overview_text)
+
     comparison_text, alert_text = build_comparison_and_alert(comparison_data)
     if comparison_text:
         sections.append(comparison_text)
