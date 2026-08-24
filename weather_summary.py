@@ -59,9 +59,17 @@ ALERT_PRECIP_MM = 15.0
 ALERT_GUST_KMH = 70.0
 
 # Trefferquote-Konfiguration
-VERIFY_LEAD_DAYS = 2       # "wie gut war die Vorhersage X Tage vorher"
-VERIFY_WINDOW_DAYS = 5     # über wie viele Tage gemittelt wird
-VERIFY_LATENCY_DAYS = 6    # Sicherheitsabstand zur ERA5-Verzögerung (~5 Tage)
+# Bewusst konservativ (kleine Werte): der erste Live-Test zeigte "Keine
+# auswertbaren Tage" für alle Modelle - vermutlich unterstützt Open-Meteos
+# Previous-Runs-API nicht so viele "previous_dayN"-Spalten zurück, wie die
+# ursprüngliche Kombination (Latenz 6 + Fenster 5 + Vorlauf 2 = bis zu
+# previous_day12) gebraucht hätte. Mit kleineren Werten (max. previous_day7)
+# steigt die Chance, dass die Spalten wirklich existieren. Zusätzlich gibt
+# es jetzt eine Diagnose-Ausgabe der tatsächlich vorhandenen Spalten, falls
+# es wieder leer bleibt - dann sieht man im Log genau, wie tief die API geht.
+VERIFY_LEAD_DAYS = 1        # "wie gut war die Vorhersage X Tage vorher"
+VERIFY_WINDOW_DAYS = 2      # über wie viele Tage gemittelt wird
+VERIFY_LATENCY_DAYS = 5     # Sicherheitsabstand zur ERA5-Verzögerung (~5 Tage)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +255,11 @@ def fetch_verification_text():
     prev_times = prev_daily.get("time", [])
     arch_daily = arch.get("daily", {})
     arch_times = arch_daily.get("time", [])
+    print(
+        f"  [Diagnose/Trefferquote] angefragt: past_days={max_n}, Ziel-Daten={[d.isoformat() for d in target_dates]}, "
+        f"prev_times={prev_times[:1]}..{prev_times[-1:]} ({len(prev_times)}), "
+        f"arch_times={arch_times[:1]}..{arch_times[-1:]} ({len(arch_times)})"
+    )
     if not prev_times or not arch_times:
         print("  [Diagnose/Trefferquote] Keine Zeitreihe in der Antwort - übersprungen.")
         return None
@@ -254,6 +267,7 @@ def fetch_verification_text():
     lines = []
     for display_name, model_id in OPEN_METEO_MODELS.items():
         temp_errors, precip_errors = [], []
+        missing_key_logged = False
         for D in target_dates:
             n = (today - D).days + VERIFY_LEAD_DAYS
             d_str = D.isoformat()
@@ -268,6 +282,10 @@ def fetch_verification_text():
                 actual_temp = (arch_daily.get("temperature_2m_max") or [None] * len(arch_times))[idx_arch]
                 if isinstance(fc_temp, (int, float)) and isinstance(actual_temp, (int, float)):
                     temp_errors.append(abs(fc_temp - actual_temp))
+            elif not missing_key_logged:
+                model_keys = sorted(k for k in prev_daily if model_id in k)
+                print(f"  [Diagnose/Trefferquote] Keine Spalte 'previous_day{n}' für {display_name} - vorhandene Spalten: {model_keys}")
+                missing_key_logged = True
 
             k_precip = _find_prev_run_key(prev_daily, "precipitation_sum", model_id, n)
             if k_precip:
