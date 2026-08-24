@@ -1,0 +1,46 @@
+name: Kachelmannwetter Freiburg-Temperatur an Telegram senden
+
+on:
+  schedule:
+    # UTC-Zeiten! 06:00 und 16:00 UTC (wie im Beispiel-Link "...z" gewünscht)
+    - cron: "0 6 * * *"
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      target_hour:
+        description: "Zielstunde UTC für einen manuellen Testlauf (6 oder 16)"
+        required: false
+        default: "6"
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Abhängigkeiten installieren
+        run: pip install requests
+
+      - name: Zielstunde anhand des Cron-Zeitplans bestimmen
+        id: hour
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 6 * * *" ]; then
+            echo "value=6" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 16 * * *" ]; then
+            echo "value=16" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.target_hour || '6' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Karte senden
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_HOUR_UTC: ${{ steps.hour.outputs.value }}
+        run: python send_kachelmann.py
