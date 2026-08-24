@@ -191,46 +191,75 @@ def _bust_cache(url: str, now_utc: datetime) -> str:
 
 def image_exists(url: str, now_utc: datetime = None) -> bool:
     """
-    Prüft, ob unter der URL tatsächlich ein Bild liegt (statt einer Fehlerseite).
-
-    WICHTIG: Die Kartei-Bilder (MAP_URL) enthalten KEIN Datum im Dateinamen, nur
-    die Laufzeit (z.B. "...ME12_0_2.png") - dieselbe Datei wird jeden Tag am
-    selben Pfad überschrieben. Ein reiner Status-200-Check reicht deshalb nicht:
-    falls wetterzentrale.de die Datei mal nicht neu erzeugt hat (oder ein
-    zwischengeschalteter Cache eine alte Kopie ausliefert), sähe die alte Datei
-    von vor Tagen identisch "gültig" aus. Deshalb zwei Schutzschichten:
-
-    1. Cache-Busting: eindeutiger Query-Parameter + No-Cache-Header bei jedem
-       Abruf, damit eine evtl. zwischengespeicherte alte Kopie umgangen wird.
-    2. Last-Modified-Check gegen die TATSÄCHLICHE aktuelle Zeit (now_utc), NICHT
-       gegen den gerade getesteten Kandidaten-Lauf - sonst würde die Rückwärts-
-       suche einfach so lange zurücklaufen, bis eine uralte Datei "zufällig"
-       wieder zu einem alten Kandidaten-Lauf passt.
+    Einfacher Existenz-Check (Status 200 + Bild-Content-Type), OHNE Freshness-
+    Prüfung. Wird nur noch für die Ebringen-Diagramme benutzt, deren URL bereits
+    ein explizites Datum enthält (siehe find_latest_diagram) - dort reicht das.
+    Für die Gesamtkarten (MAP_URL, kein Datum im Pfad) wird stattdessen
+    fetch_map_freshness() + is_fresh_for_run() verwendet (siehe unten), weil ein
+    reiner "jünger als X Stunden"-Check dort zu falsch beschrifteten Karten
+    geführt hat (eine Restdatei vom Vortag war "jung genug" und wurde
+    fälschlich als heutiger Lauf ausgegeben).
     """
     try:
         r = requests.get(url, headers=NO_CACHE_HEADERS, timeout=20, stream=True)
         ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image")
-        if now_utc is not None:
-            last_mod_raw = r.headers.get("Last-Modified")
-            print(f"  [Last-Modified-Check] status={r.status_code} Last-Modified='{last_mod_raw}' -> {url}")
-            if ok and last_mod_raw:
-                try:
-                    lm_dt = parsedate_to_datetime(last_mod_raw)
-                    if lm_dt.tzinfo is None:
-                        lm_dt = lm_dt.replace(tzinfo=timezone.utc)
-                    age = now_utc - lm_dt
-                    if age > timedelta(hours=MAX_STALENESS_HOURS):
-                        print(
-                            f"  (verworfen, veraltet: Last-Modified {lm_dt.isoformat()} "
-                            f"ist {age} alt (> {MAX_STALENESS_HOURS}h) -> {url})"
-                        )
-                        ok = False
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  (Last-Modified '{last_mod_raw}' nicht parsebar: {exc})")
         r.close()
         return ok
     except requests.RequestException:
         return False
+
+
+def fetch_map_freshness(url: str):
+    """
+    Ein einziger GET auf eine Kartei-URL. Gibt (status_ok, last_modified_dt)
+    zurück - last_modified_dt ist None, wenn kein/kein parsebarer Header da war.
+    Wird in find_latest_map nur EINMAL pro (Modell, Member, Vorhersagestunde)
+    aufgerufen und das Ergebnis dann gegen mehrere Kandidaten-Läufe geprüft
+    (siehe is_fresh_for_run) - vorher wurde dieselbe URL bis zu MAX_DAY_FALLBACKS
+    mal unnötig neu abgerufen, weil die Kartei-URL ohnehin kein Datum enthält
+    und sich beim "Tage zurück probieren" gar nicht ändert.
+    """
+    try:
+        r = requests.get(url, headers=NO_CACHE_HEADERS, timeout=20, stream=True)
+    except requests.RequestException as exc:
+        print(f"  [Last-Modified-Check] Fehler: {exc} -> {url}")
+        return False, None
+
+    ok = r.status_code == 200 and r.headers.get("Content-Type", "").startswith("image")
+    last_mod_raw = r.headers.get("Last-Modified")
+    lm_dt = None
+    if last_mod_raw:
+        try:
+            lm_dt = parsedate_to_datetime(last_mod_raw)
+            if lm_dt.tzinfo is None:
+                lm_dt = lm_dt.replace(tzinfo=timezone.utc)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (Last-Modified '{last_mod_raw}' nicht parsebar: {exc})")
+    print(f"  [Last-Modified-Check] status={r.status_code} Last-Modified='{last_mod_raw}' -> {url}")
+    r.close()
+    return ok, lm_dt
+
+
+def is_fresh_for_run(lm_dt: datetime, run_dt: datetime, now_utc: datetime):
+    """
+    Prüft, ob eine Datei mit Last-Modified=lm_dt tatsächlich zum Kandidaten-
+    Lauf run_dt gehören KANN - nicht nur, ob sie "neu genug" ist. Zwei
+    Bedingungen, beide müssen stimmen:
+
+    1. lm_dt darf nicht vor run_dt liegen (mit kleiner Toleranz): eine Datei,
+       die VOR dem Beginn des Laufs zuletzt geändert wurde, kann unmöglich
+       Daten DIESES Laufs zeigen - das ist der Kern-Fix für das Problem, dass
+       Restdateien vom Vortag fälschlich als "heutiger Lauf" beschriftet
+       wurden (deren Last-Modified lag vor dem behaupteten Lauf-Beginn).
+    2. lm_dt darf nicht älter als MAX_STALENESS_HOURS (ab jetzt) sein - reines
+       Sicherheitsnetz, damit die Tage-Rückwärtssuche nicht am Ende doch noch
+       eine wirklich uralte Datei akzeptiert.
+    """
+    if now_utc - lm_dt > timedelta(hours=MAX_STALENESS_HOURS):
+        return False, f"zu alt: {lm_dt.isoformat()} ist > {MAX_STALENESS_HOURS}h vor jetzt"
+    if lm_dt < run_dt - timedelta(minutes=15):
+        return False, f"Datei ({lm_dt.isoformat()}) ist älter als der geprüfte Lauf {run_dt.isoformat()} -> gehört nicht dazu"
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -248,14 +277,41 @@ def find_latest_map(model: str, preferred_lid: str, now_utc: datetime, time_cand
     rückwärts bis zu MAX_DAY_FALLBACKS Tage. Für jeden Lauf: erst das bevorzugte
     Member (z.B. AVG), sonst "OP"; für jedes Member werden die time_candidates
     von der LÄNGSTEN Vorhersagestunde absteigend probiert - "so weit wie möglich".
+
+    WICHTIG: Die Kartei-URL enthält kein Datum, ändert sich beim Tage-Rückwärts-
+    Probieren also NICHT - jede (Member, Vorhersagestunde)-Kombination wird
+    deshalb nur EINMAL per HTTP abgerufen (fetch_map_freshness, gecached in
+    `fetched`) und das Ergebnis dann gegen jeden Kandidaten-Lauf geprüft
+    (is_fresh_for_run), statt dieselbe URL bis zu MAX_DAY_FALLBACKS mal neu
+    abzurufen.
     """
-    run_dt = latest_target_run_slot(now_utc)
-    for _ in range(MAX_DAY_FALLBACKS):
+    base_run_dt = latest_target_run_slot(now_utc)
+    fetched = {}  # url -> (status_ok, last_modified_dt)
+
+    def check(url):
+        if url not in fetched:
+            fetched[url] = fetch_map_freshness(url)
+        return fetched[url]
+
+    run_dt = base_run_dt
+    for day_i in range(MAX_DAY_FALLBACKS):
         for lid in dict.fromkeys([preferred_lid, "OP"]):  # preferred zuerst, Duplikate raus
             for time_hour in time_candidates:
-                url = build_map_url(model, lid, run_dt, time_hour, var, now_utc)
-                if image_exists(url, now_utc=now_utc):
+                url = build_map_url(model, lid, base_run_dt, time_hour, var, now_utc)
+                status_ok, lm_dt = check(url)
+                if not status_ok:
+                    continue
+                if lm_dt is None:
+                    # kein Last-Modified-Header: keine Freshness-Prüfung möglich - nur
+                    # beim allerersten (aktuellsten) Ziel-Lauf ungeprüft akzeptieren,
+                    # sonst könnte eine uralte Datei fälschlich als älterer Lauf durchgehen.
+                    if day_i == 0:
+                        return url, lid, run_dt, time_hour
+                    continue
+                fresh, reason = is_fresh_for_run(lm_dt, run_dt, now_utc)
+                if fresh:
                     return url, lid, run_dt, time_hour
+                print(f"  (verworfen für Lauf {run_dt.isoformat()}: {reason})")
         run_dt -= timedelta(days=1)
     return None, None, None, None
 
