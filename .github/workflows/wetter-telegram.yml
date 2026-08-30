@@ -2,10 +2,11 @@ name: Wetterkarten an Telegram senden
 
 on:
   schedule:
-    # UTC-Zeiten! Aktuell 06:00 / 12:00 / 18:00 UTC
-    # = 08:00 / 14:00 / 20:00 Uhr Sommerzeit (CEST, UTC+2)
-    # = 07:00 / 13:00 / 19:00 Uhr Winterzeit (CET,  UTC+1)
-    - cron: "0 6,12,18 * * *"
+    # UTC-Zeiten! Aktuell 05:00 / 18:00 UTC
+    # = 07:00 / 20:00 Uhr Sommerzeit (CEST, UTC+2) <- so aktuell eingestellt
+    # = 06:00 / 19:00 Uhr Winterzeit (CET,  UTC+1) - im Winter ggf. auf "0 6,19 * * *" anpassen,
+    #   falls es dann wieder 07:00/20:00 Uhr lokal sein soll
+    - cron: "0 5,18 * * *"
   workflow_dispatch: {}   # erlaubt manuelles Auslösen zum Testen ("Run workflow" Button)
 
 jobs:
